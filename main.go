@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"image"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"net/http"
@@ -57,19 +60,6 @@ func compressHardler(c *gin.Context){
 	}
 	
 	img, format, err := image.Decode(bytes.NewReader(src))
-	if format == "jpeg"{
-		qualityStr := c.DefaultQuery("scale", "1.0")
-		if qualityStr != ""{
-			quality, err := strconv.ParseFloat(qualityStr, 64)
-			if quality < 1 || quality > 100 {
-				err = errors.New("quality out size.")
-			}
-			if err != nil{
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-		}
-	}
 	
 	if scale != 1.0{
 		b := img.Bounds()
@@ -83,4 +73,34 @@ func compressHardler(c *gin.Context){
 		xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, b, xdraw.Src, nil)
 		img = dst
 	}	
+
+	var buf bytes.Buffer
+	var mime string
+	switch format {
+	case "png":
+		enc := png.Encoder{CompressionLevel: png.BestCompression}
+		err = enc.Encode(&buf, img)
+		mime = "image/png"
+	case "gif":
+		err = gif.Encode(&buf, img, nil)
+		mime = "image/gif"
+	default:
+		qualityStr := c.Query("scale")
+		quality, err := strconv.Atoi(qualityStr)
+		if quality < 1 || quality > 100 {
+			err = errors.New("quality out size.")
+		}
+		if err != nil{
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
+		mime = "image/jpeg"
+	}
+	if err != nil{
+		c.JSON(http.StatusBadRequest, gin.H{"error":err.Error()})
+		return
+	}
+
+	c.Data(http.StatusOK, mime, buf.Bytes())
 }
