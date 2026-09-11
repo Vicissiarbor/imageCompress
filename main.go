@@ -9,8 +9,10 @@ import (
 	"image/png"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	xdraw "golang.org/x/image/draw"
@@ -19,10 +21,41 @@ import (
 func main(){
 	rounter := gin.Default()
 	rounter.MaxMultipartMemory = 16 << 20
+
+	tokens := tokenInit()
+	rounter.Use(RateLimitMiddleware(tokens))
 	
 	rounter.POST("/compress", compressHardler)
 
 	rounter.Run(":46939")
+}
+
+func tokenInit()chan struct{}{
+	ch := make(chan struct{}, 1)
+	go func(){
+		ticker := time.NewTicker(time.Second/3)
+		defer ticker.Stop()
+
+		for range ticker.C{
+			select{
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	return ch
+}
+
+func RateLimitMiddleware(ch chan struct{}) gin.HandlerFunc{
+	return func(c *gin.Context){
+		select{
+		case <- ch:
+			c.Next()
+		default:
+			err := errors.New("Too many requests.")
+			c.JSON(http.StatusTooManyRequests, gin.H{"error":err.Error()})
+		}
+	}
 }
 
 func compressHardler(c *gin.Context){
@@ -50,7 +83,7 @@ func compressHardler(c *gin.Context){
 	scaleStr := c.Query("scale")
 	if scaleStr != ""{
 		scale, err = strconv.ParseFloat(scaleStr, 64)
-		if scale <= 0 || scale > 1.0 {
+		if scale <= 0 || scale > 1.0 || scale==math.NaN(){
 			err = errors.New("scale out size.")
 		}
 		if err != nil{
@@ -59,7 +92,21 @@ func compressHardler(c *gin.Context){
 		}
 	}
 	
+	qualityStr := c.Query("quality")
+	quality, err := strconv.Atoi(qualityStr)
+	if quality < 1 || quality > 100 {
+		err = errors.New("quality out size.")
+	}
+	if err != nil{
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	img, format, err := image.Decode(bytes.NewReader(src))
+	if err != nil{
+		c.JSON(http.StatusBadRequest, gin.H{"error":err.Error()})
+		return
+	}
 	
 	if scale != 1.0{
 		b := img.Bounds()
@@ -85,15 +132,6 @@ func compressHardler(c *gin.Context){
 		err = gif.Encode(&buf, img, nil)
 		mime = "image/gif"
 	default:
-		qualityStr := c.Query("scale")
-		quality, err := strconv.Atoi(qualityStr)
-		if quality < 1 || quality > 100 {
-			err = errors.New("quality out size.")
-		}
-		if err != nil{
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-			return
-		}
 		err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
 		mime = "image/jpeg"
 	}
