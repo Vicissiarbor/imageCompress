@@ -32,6 +32,7 @@ func main(){
 
 func tokenInit()chan struct{}{
 	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
 	go func(){
 		ticker := time.NewTicker(time.Second/3)
 		defer ticker.Stop()
@@ -54,6 +55,7 @@ func RateLimitMiddleware(ch chan struct{}) gin.HandlerFunc{
 		default:
 			err := errors.New("Too many requests.")
 			c.JSON(http.StatusTooManyRequests, gin.H{"error":err.Error()})
+			c.Abort()
 		}
 	}
 }
@@ -83,7 +85,7 @@ func compressHardler(c *gin.Context){
 	scaleStr := c.Query("scale")
 	if scaleStr != ""{
 		scale, err = strconv.ParseFloat(scaleStr, 64)
-		if scale <= 0 || scale > 1.0 || scale==math.NaN(){
+		if scale <= 0 || scale > 1.0 || math.IsNaN(scale){
 			err = errors.New("scale out size.")
 		}
 		if err != nil{
@@ -92,8 +94,9 @@ func compressHardler(c *gin.Context){
 		}
 	}
 	
+	quality := 100
 	qualityStr := c.Query("quality")
-	quality, err := strconv.Atoi(qualityStr)
+	quality, err = strconv.Atoi(qualityStr)
 	if quality < 1 || quality > 100 {
 		err = errors.New("quality out size.")
 	}
