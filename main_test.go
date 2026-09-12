@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/gif"
@@ -173,10 +175,9 @@ func checkSuccessImage(t *testing.T, rec *httptest.ResponseRecorder, wantMime, w
 }
 
 // TestCompressHardler_PNG 测试 PNG 上传。
-// 注意:quality 参数对所有格式都是必填的(设计如此:PNG/GIF 编码时
-// 并不使用它,但不传会在校验阶段被拒)。main.go 里虽写了 `quality := 100`
-// 看似给了默认值,但 Atoi 解析失败时会把 quality 覆盖成 0,再触发范围
-// 校验返回 400,所以"默认100"实际不生效——下面的用例如实断言 400。
+// quality 参数对所有格式都可选:缺省时 main.go 使用默认值 100
+// (上一版"默认值被 Atoi 失败覆盖"的死代码问题已修复);
+// PNG/GIF 编码并不使用该值,传了只会被校验合法性。
 func TestCompressHardler_PNG(t *testing.T) {
 	router := newRouter()
 
@@ -190,7 +191,7 @@ func TestCompressHardler_PNG(t *testing.T) {
 		{name: "quality=80压缩不缩放", query: "?quality=80", wantStatus: 200, wantW: 100, wantH: 80},
 		{name: "scale=0.5缩放一半", query: "?scale=0.5&quality=80", wantStatus: 200, wantW: 50, wantH: 40},
 		{name: "scale=1.0保持原尺寸", query: "?scale=1.0&quality=80", wantStatus: 200, wantW: 100, wantH: 80},
-		{name: "不传quality返回400", query: "", wantStatus: 400},
+		{name: "不传quality使用默认100", query: "", wantStatus: 200, wantW: 100, wantH: 80},
 	}
 
 	for _, tt := range tests {
@@ -247,7 +248,7 @@ func TestCompressHardler_JPEG(t *testing.T) {
 		{name: "scale=0.5加quality=80", query: "?scale=0.5&quality=80", wantStatus: 200, wantW: 50, wantH: 40},
 		{name: "quality=1最低质量", query: "?quality=1", wantStatus: 200, wantW: 100, wantH: 80},
 		{name: "quality=100最高质量", query: "?quality=100", wantStatus: 200, wantW: 100, wantH: 80},
-		{name: "不传quality返回400", query: "", wantStatus: 400},
+		{name: "不传quality使用默认100", query: "", wantStatus: 200, wantW: 100, wantH: 80},
 		{name: "quality=0越界返回400", query: "?quality=0", wantStatus: 400},
 		{name: "quality=101越界返回400", query: "?quality=101", wantStatus: 400},
 		{name: "quality不是整数返回400", query: "?quality=abc", wantStatus: 400},
@@ -347,6 +348,79 @@ func TestCompressHardler_CorruptImage(t *testing.T) {
 			checkErrorJSON(t, rec)
 		})
 	}
+}
+
+// makePNGHeader 手工拼装一个"PNG 签名 + 合法 IHDR 头 + 垃圾正文"的文件。
+// 这样测试里能廉价地构造"声明尺寸巨大"的解压炸弹图片:
+// image.DecodeConfig 只读 IHDR(会校验 CRC),不需要真的生成几千万像素。
+func makePNGHeader(t *testing.T, width, height uint32) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) // PNG 签名
+
+	ihdr := make([]byte, 0, 13)
+	ihdr = binary.BigEndian.AppendUint32(ihdr, width)
+	ihdr = binary.BigEndian.AppendUint32(ihdr, height)
+	ihdr = append(ihdr, 8, 2, 0, 0, 0) // 位深8、真彩色、压缩/过滤/隔行均默认
+
+	var chunkLen [4]byte
+	binary.BigEndian.PutUint32(chunkLen[:], uint32(len(ihdr)))
+	buf.Write(chunkLen[:])
+	buf.WriteString("IHDR")
+	buf.Write(ihdr)
+
+	var crc [4]byte
+	binary.BigEndian.PutUint32(crc[:], crc32.ChecksumIEEE(append([]byte("IHDR"), ihdr...)))
+	buf.Write(crc[:])
+
+	buf.Write(bytes.Repeat([]byte{0xff}, 32)) // IHDR 之后全是坏字节,完整解码必然失败
+	return buf.Bytes()
+}
+
+// TestCompressHardler_ImageTooLarge 测试防"图片炸弹"的尺寸上限:
+// main.go 在完整解码前先用 image.DecodeConfig 读头部尺寸,
+// 宽或高 > 4096 直接返回 400 "Image is too large."。
+// (炸弹图用 makePNGHeader 构造,小图用例已由上面的测试覆盖。)
+func TestCompressHardler_ImageTooLarge(t *testing.T) {
+	router := newRouter()
+
+	const tooLargeMsg = "Image is too large."
+
+	t.Run("声明5000x5000的炸弹图被尺寸校验拒绝", func(t *testing.T) {
+		rec := postImage(t, router, "?quality=80", "image", "bomb.png", makePNGHeader(t, 5000, 5000))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d, 期望 400", rec.Code)
+		}
+		var payload struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("解析错误响应失败: %v (body: %q)", err, rec.Body.String())
+		}
+		if payload.Error != tooLargeMsg {
+			t.Errorf("error = %q, 期望 %q(应被尺寸上限拦截,而不是走到完整解码)", payload.Error, tooLargeMsg)
+		}
+	})
+
+	t.Run("边界4096x4096不被尺寸校验拒绝", func(t *testing.T) {
+		// 这个夹具只有合法头部、正文是坏字节:它会"通过"尺寸校验,
+		// 然后在完整解码时报 PNG 格式错误。只要错误不是
+		// "Image is too large.",就证明 4096(含)是被放行的。
+		rec := postImage(t, router, "?quality=80", "image", "edge.png", makePNGHeader(t, 4096, 4096))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("状态码 = %d, 期望 400(坏正文应报解码错误)", rec.Code)
+		}
+		var payload struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("解析错误响应失败: %v (body: %q)", err, rec.Body.String())
+		}
+		if payload.Error == tooLargeMsg {
+			t.Errorf("4096x4096 应当通过尺寸校验(上限为 >4096 才拒绝),却收到 %q", payload.Error)
+		}
+	})
 }
 
 // TestRateLimitMiddleware_NoToken 测试没有令牌时返回 429。
