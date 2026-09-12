@@ -18,27 +18,27 @@ import (
 	xdraw "golang.org/x/image/draw"
 )
 
-func main(){
+func main() {
 	rounter := gin.Default()
 	rounter.MaxMultipartMemory = 16 << 20
 
 	tokens := tokenInit()
 	rounter.Use(RateLimitMiddleware(tokens))
-	
+
 	rounter.POST("/compress", compressHardler)
 
 	rounter.Run(":46939")
 }
 
-func tokenInit()chan struct{}{
+func tokenInit() chan struct{} {
 	ch := make(chan struct{}, 1)
 	ch <- struct{}{}
-	go func(){
-		ticker := time.NewTicker(time.Second/3)
+	go func() {
+		ticker := time.NewTicker(time.Second / 3)
 		defer ticker.Stop()
 
-		for range ticker.C{
-			select{
+		for range ticker.C {
+			select {
 			case ch <- struct{}{}:
 			default:
 			}
@@ -47,74 +47,74 @@ func tokenInit()chan struct{}{
 	return ch
 }
 
-func RateLimitMiddleware(ch chan struct{}) gin.HandlerFunc{
-	return func(c *gin.Context){
-		select{
-		case <- ch:
+func RateLimitMiddleware(ch chan struct{}) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		select {
+		case <-ch:
 			c.Next()
 		default:
 			err := errors.New("Too many requests.")
-			c.JSON(http.StatusTooManyRequests, gin.H{"error":err.Error()})
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
 			c.Abort()
 		}
 	}
 }
 
-func compressHardler(c *gin.Context){
+func compressHardler(c *gin.Context) {
 	file, err := c.FormFile("image")
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error":err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	
+
 	log.Println(file.Filename)
 
 	f, err := file.Open()
-	if err != nil{
-		c.JSON(http.StatusBadRequest, gin.H{"error":err.Error()})
-		return 
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
 	defer f.Close()
 
-	src, err := io.ReadAll(io.LimitReader(f, 8<< 20))
-	if err != nil{
-		c.JSON(http.StatusBadRequest, gin.H{"error":err.Error()})
+	src, err := io.ReadAll(io.LimitReader(f, 8<<20))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	scale := 1.0	
+	scale := 1.0
 	scaleStr := c.Query("scale")
-	if scaleStr != ""{
+	if scaleStr != "" {
 		scale, err = strconv.ParseFloat(scaleStr, 64)
-		if scale <= 0 || scale > 1.0 || math.IsNaN(scale){
+		if scale <= 0 || scale > 1.0 || math.IsNaN(scale) {
 			err = errors.New("scale out size.")
 		}
-		if err != nil{
+		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 	}
-	
+
 	quality := 100
 	qualityStr := c.Query("quality")
 	quality, err = strconv.Atoi(qualityStr)
 	if quality < 1 || quality > 100 {
 		err = errors.New("quality out size.")
 	}
-	if err != nil{
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	img, format, err := image.Decode(bytes.NewReader(src))
-	if err != nil{
-		c.JSON(http.StatusBadRequest, gin.H{"error":err.Error()})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	
-	if scale != 1.0{
+
+	if scale != 1.0 {
 		b := img.Bounds()
-		w := int(float64(b.Dx())*scale)
-		h := int(float64(b.Dy())*scale)
+		w := int(float64(b.Dx()) * scale)
+		h := int(float64(b.Dy()) * scale)
 
 		w = max(w, 1)
 		h = max(h, 1)
@@ -122,7 +122,7 @@ func compressHardler(c *gin.Context){
 		dst := image.NewRGBA(image.Rect(0, 0, w, h))
 		xdraw.CatmullRom.Scale(dst, dst.Bounds(), img, b, xdraw.Src, nil)
 		img = dst
-	}	
+	}
 
 	var buf bytes.Buffer
 	var mime string
@@ -138,8 +138,8 @@ func compressHardler(c *gin.Context){
 		err = jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality})
 		mime = "image/jpeg"
 	}
-	if err != nil{
-		c.JSON(http.StatusBadRequest, gin.H{"error":err.Error()})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
