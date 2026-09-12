@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -174,8 +173,10 @@ func checkSuccessImage(t *testing.T, rec *httptest.ResponseRecorder, wantMime, w
 }
 
 // TestCompressHardler_PNG 测试 PNG 上传。
-// 注意:修复已知问题#1后,quality 参数对所有格式都是必填的
-// (PNG/GIF 编码时并不使用它,但不传会在校验阶段被拒)。
+// 注意:quality 参数对所有格式都是必填的(设计如此:PNG/GIF 编码时
+// 并不使用它,但不传会在校验阶段被拒)。main.go 里虽写了 `quality := 100`
+// 看似给了默认值,但 Atoi 解析失败时会把 quality 覆盖成 0,再触发范围
+// 校验返回 400,所以"默认100"实际不生效——下面的用例如实断言 400。
 func TestCompressHardler_PNG(t *testing.T) {
 	router := newRouter()
 
@@ -282,6 +283,10 @@ func TestCompressHardler_InvalidScale(t *testing.T) {
 		{name: "scale为负数", query: "?scale=-0.5&quality=80"},
 		{name: "scale大于1", query: "?scale=1.5&quality=80"},
 		{name: "scale不是数字", query: "?scale=abc&quality=80"},
+		// 已知问题#4已修复:改用 math.IsNaN(scale) 后,NaN 能被正确拒绝。
+		{name: "scale=NaN被拒绝", query: "?scale=NaN&quality=80"},
+		// 补充边界:±Inf 也应当被范围校验拒绝(ParseFloat 对 Inf 不报错)。
+		{name: "scale=Inf被拒绝", query: "?scale=Inf&quality=80"},
 	}
 
 	for _, tt := range tests {
@@ -293,20 +298,6 @@ func TestCompressHardler_InvalidScale(t *testing.T) {
 			checkErrorJSON(t, rec)
 		})
 	}
-}
-
-// TestCompressHardler_ScaleNaN 记录【已知问题#4(遗留)】的当前行为:
-// main.go:86 用 scale==math.NaN() 判断 NaN,但 Go(IEEE 754)里 NaN 与
-// 任何值比较都是 false——包括它自己——所以这个判断永远不成立,NaN 依然
-// 通过校验。缩放时 int(尺寸*NaN) 得到平台相关的极值(amd64 上是极小负数),
-// 被 max(w,1) 钳制成 1,最终返回一张 1×1 的图片。
-// 正确写法是 math.IsNaN(scale)。修复后请把本用例期望改为 400,
-// 并可以直接并回 TestCompressHardler_InvalidScale 的表格。
-func TestCompressHardler_ScaleNaN(t *testing.T) {
-	router := newRouter()
-
-	rec := postImage(t, router, "?scale=NaN&quality=80", "image", "test.png", makePNG(t, 100, 80))
-	checkSuccessImage(t, rec, "image/png", "png", 1, 1)
 }
 
 // TestCompressHardler_MissingFile 测试请求里没有图片文件时应当返回 400。
@@ -361,12 +352,9 @@ func TestCompressHardler_CorruptImage(t *testing.T) {
 // TestRateLimitMiddleware_NoToken 测试没有令牌时返回 429。
 // 用手动创建的通道(不启动补充协程)保证结果完全确定。
 //
-// 【已知问题#5】429 分支缺少 c.Abort():按 gin 的机制,中间件返回后
-// compressHardler 仍会完整执行一遍——被"拒绝"的请求照样消耗全部
-// CPU/内存,且响应体在 JSON 错误后面还追加了 PNG 字节(脏响应)。
-// 修法:在 c.JSON 之后加 c.Abort(),或改用 c.AbortWithStatusJSON。
-// 本测试当前记录现状;修复 Abort 后请把"body 更长"的断言改为
-// "body 恰好等于 JSON 错误"。
+// 已知问题#5已修复:429 分支现在会在 c.JSON 之后调用 c.Abort(),
+// handler 不再执行——响应体应当是"恰好等于"的纯 JSON 错误,
+// 后面不能再粘任何图片字节。
 func TestRateLimitMiddleware_NoToken(t *testing.T) {
 	ch := make(chan struct{}, 1) // 空通道 = 没有令牌
 	router := newRouterWithLimit(ch)
@@ -376,14 +364,9 @@ func TestRateLimitMiddleware_NoToken(t *testing.T) {
 		t.Fatalf("状态码 = %d, 期望 429", rec.Code)
 	}
 
-	const wantPrefix = `{"error":"Too many requests."}`
-	body := rec.Body.String()
-	if !strings.HasPrefix(body, wantPrefix) {
-		t.Fatalf("响应体不以期望的JSON开头, 实际: %q", body)
-	}
-	if len(body) == len(wantPrefix) {
-		t.Errorf("已知问题#5的当前行为是:handler仍会执行并在JSON后追加图片字节," +
-			"现在body只剩JSON了——如果你已经加了c.Abort(),请同步把本断言改为body恰好等于JSON")
+	const wantJSON = `{"error":"Too many requests."}`
+	if body := rec.Body.String(); body != wantJSON {
+		t.Fatalf("响应体 = %q, 期望恰好等于 %q(若后面粘了图片字节,说明 c.Abort() 又丢了)", body, wantJSON)
 	}
 }
 
@@ -405,6 +388,7 @@ func TestRateLimitMiddleware_WithToken(t *testing.T) {
 
 // TestRateLimitMiddleware_TokenInit 测试 tokenInit 的令牌自动补充:
 // 每 1/3 秒补一个令牌,通道容量为 1(即平均限速约 3 请求/秒,突发上限 1)。
+// 已知问题#6已修复:tokenInit 现在预放了一个初始令牌,首个请求立即成功。
 func TestRateLimitMiddleware_TokenInit(t *testing.T) {
 	tokens := tokenInit() // 后台协程每 333ms 尝试补一个令牌
 	router := newRouterWithLimit(tokens)
@@ -413,17 +397,9 @@ func TestRateLimitMiddleware_TokenInit(t *testing.T) {
 		return postImage(t, router, "?quality=80", "image", "test.png", makePNG(t, 10, 10)).Code
 	}
 
-	// 1) 通道初始为空(第一个令牌要等第一次 tick),轮询等待拿到首个令牌。
-	gotToken := false
-	for i := 0; i < 20; i++ {
-		if doReq() == http.StatusOK {
-			gotToken = true
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !gotToken {
-		t.Fatal("2秒内始终没有拿到令牌, tokenInit 的补充协程可能没有工作")
+	// 1) 通道已预放初始令牌:首个请求应当立即 200,无需等待。
+	if code := doReq(); code != http.StatusOK {
+		t.Fatalf("首个请求状态码 = %d, 期望 200(初始令牌应已预放进通道)", code)
 	}
 
 	// 2) 令牌刚被消耗,立刻连发 3 个请求:即使期间恰好 tick 补充了 1 个,
