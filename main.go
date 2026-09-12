@@ -96,11 +96,24 @@ func compressHardler(c *gin.Context) {
 
 	quality := 100
 	qualityStr := c.Query("quality")
-	quality, err = strconv.Atoi(qualityStr)
-	if quality < 1 || quality > 100 {
-		err = errors.New("quality out size.")
+	if qualityStr != "" {
+		quality, err = strconv.Atoi(qualityStr)
+		if quality < 1 || quality > 100 {
+			err = errors.New("quality out size.")
+		}
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
+
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(src))
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if cfg.Height > 4096 || cfg.Width > 4096 {
+		err = errors.New("Image is too large.")
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
